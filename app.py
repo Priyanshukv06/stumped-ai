@@ -65,6 +65,15 @@ for msg in st.session_state.messages:
             with st.expander("📊 View Python Plot Code"):
                 st.code(msg["plot_code"], language="python")
                 
+        # Render the raw CSV data
+        if msg.get("csv_path") and os.path.exists(msg["csv_path"]):
+            import pandas as pd
+            try:
+                df = pd.read_csv(msg["csv_path"])
+                st.dataframe(df, use_container_width=True)
+            except Exception:
+                pass
+                
         # If this message has a saved plot, render it inline
         if msg.get("plot_path") and os.path.exists(msg["plot_path"]):
             with open(msg["plot_path"], 'r', encoding='utf-8') as f:
@@ -119,6 +128,16 @@ if prompt := st.chat_input("E.g., Which 5 teams hit the most sixes in 2024? Plot
             with st.expander("📊 View Python Plot Code"):
                 st.code(result["plot_code"], language="python")
 
+        # Render the raw CSV data to avoid LLM hallucination
+        csv_path = result.get("csv_path")
+        if csv_path and os.path.exists(csv_path):
+            import pandas as pd
+            try:
+                df = pd.read_csv(csv_path)
+                st.dataframe(df, use_container_width=True)
+            except Exception as e:
+                st.error(f"Failed to load raw data: {e}")
+
         # Render the Plotly chart if one was generated
         plot_path = result.get("plot_path")
         if plot_path and os.path.exists(plot_path):
@@ -131,5 +150,6 @@ if prompt := st.chat_input("E.g., Which 5 teams hit the most sixes in 2024? Plot
             "content": result["answer"],
             "plot_path": plot_path,
             "sql_queries": result.get("sql_queries", []),
-            "plot_code": result.get("plot_code", "")
+            "plot_code": result.get("plot_code", ""),
+            "csv_path": csv_path
         })

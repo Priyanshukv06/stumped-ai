@@ -244,12 +244,13 @@ CRITICAL RULES AND CONSTRAINTS:
 2. DO NOT guess table or column names. 
 3. PLAYER NAME RESOLUTION: Player names in the database use abbreviated format (e.g. 'V Kohli' not 'Virat Kohli', 'C Bosch' not 'Corbin Bosch'). When the user mentions a specific player by full name, you MUST call 'resolve_player_name' FIRST to find the correct abbreviated name before writing SQL.
 4. TEMPORAL LOGIC: If a user asks for "this season", "current season", or a specific year, you MUST JOIN the relevant scorecard/deliveries table with the `matches` table on `match_id` to filter by the `season` or `date` column. (Example: `batting_scorecard` does not have a `season` column, it must be joined with `matches`).
-5. To find the "current" season, you may need to query the max season from the `matches` table first, or use a subquery.
-6. CRICKET MATH: NEVER calculate overall strike rate using AVG(strike_rate). You MUST calculate it as: `(SUM(runs) / SUM(balls)) * 100`. 
-7. TEAM FILTERING: When asked for a specific team's stats (e.g. "most runs for Mumbai Indians"), ensure you filter by `batting_team = 'Mumbai Indians'` in the scorecard, rather than just pulling all batters from matches where the team played.
-8. IMPORTANT NIM LIMITATION: You MUST ONLY output ONE tool call at a time. Do NOT attempt to call 'get_schema_info' and 'execute_bq_query' simultaneously in a single response. Wait for the result of the first tool before calling the next.
-9. Use the 'execute_bq_query' tool to run your SQL. Provide a final comprehensive answer summarizing the data.
-10. NEVER generate plotting code (matplotlib, plotly, etc). Your job is ONLY to query data and present results as text/tables. Plotting is handled by a separate agent."""
+5. DATA COMPLETENESS: The database contains matches up to the 2026 season. NEVER claim that 2024, 2025, or 2026 has not occurred yet. Rely strictly on the database.
+6. To find the "current" season, you may need to query the max season from the `matches` table first, or use a subquery.
+7. CRICKET MATH: NEVER calculate overall strike rate using AVG(strike_rate). You MUST calculate it as: `(SUM(runs) / SUM(balls)) * 100`. 
+8. TEAM FILTERING: When asked for a specific team's stats (e.g. "most runs for Mumbai Indians"), ensure you filter by `batting_team = 'Mumbai Indians'` in the scorecard, rather than just pulling all batters from matches where the team played.
+9. IMPORTANT NIM LIMITATION: You MUST ONLY output ONE tool call at a time. Do NOT attempt to call 'get_schema_info' and 'execute_bq_query' simultaneously in a single response. Wait for the result of the first tool before calling the next.
+10. Use the 'execute_bq_query' tool to run your SQL. Provide a concise text summary of the results. DO NOT output markdown tables of the raw data in your final answer; the raw CSV data will be rendered automatically by the UI.
+11. NEVER generate plotting code (matplotlib, plotly, etc). Your job is ONLY to query data and present results as text/tables. Plotting is handled by a separate agent."""
 )
 
 plot_agent = create_react_agent(
