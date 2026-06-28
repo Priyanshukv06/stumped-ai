@@ -2,7 +2,7 @@
 
 ![Live Demo](https://img.shields.io/badge/Live-Demo-brightgreen)
 
-> **Live Application**: [Insert Render URL Here]
+> **Live Application**: [https://stumped-ai.onrender.com/]
 
 ## Overview
 The IPL Analytics AI Agent is a powerful, LangGraph-powered conversational assistant that allows you to ask complex questions about the Indian Premier League (IPL) and receive dynamic, accurate data analysis and visual plots. 
