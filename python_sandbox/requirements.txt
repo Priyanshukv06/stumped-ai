@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+pandas
+plotly
+numpy
+gcsfs
+google-cloud-storage

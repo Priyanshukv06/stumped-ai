@@ -1,0 +1,16 @@
+# Environment
+.env
+__pycache__/
+*.pyc
+
+# Data & Output
+data_pipeline/*.csv
+query_results/
+plots/
+
+# IDE
+.vscode/
+
+# Secrets
+service-account/
+*.json

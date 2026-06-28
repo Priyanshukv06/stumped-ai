@@ -1,0 +1,23 @@
+# Core LangChain & Agents
+langchain-core
+langchain-nvidia-ai-endpoints
+langgraph
+
+# Data & Environment
+pandas
+python-dotenv
+
+# Google Cloud
+google-cloud-bigquery
+db-dtypes
+pandas-gbq
+
+# Visualization
+plotly
+
+# Web Scraping (Trivia Agent)
+requests
+beautifulsoup4
+
+# Frontend
+streamlit
