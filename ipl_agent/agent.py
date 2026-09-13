@@ -5,6 +5,7 @@ import urllib.parse
 from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
 import requests
+from ddgs import DDGS
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -13,7 +14,7 @@ from pydantic import BaseModel, Field
 
 from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
-from langchain_nvidia_ai_endpoints import ChatNVIDIA
+from ipl_agent.llm.langchain_wrapper import RoutedChatModel
 from langgraph.prebuilt import create_react_agent
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
@@ -31,20 +32,12 @@ if os.path.exists(local_service_account) and not os.getenv("GOOGLE_APPLICATION_C
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "adk-mini-project")
 GCP_DATASET_ID = os.getenv("GCP_DATASET_ID", "ipl_stats")
 
-# Ensure API key exists
-nvidia_key = os.getenv("NVIDIA_NIM_API_KEY") or os.getenv("NVIDIA_API_KEY")
-if not nvidia_key:
-    raise ValueError("NVIDIA_NIM_API_KEY not found. Check your .env file.")
-
-# Configure LLM using ChatNVIDIA wrapper for native NIM support
-llm = ChatNVIDIA(
-    model="google/diffusiongemma-26b-a4b-it", 
-    api_key=nvidia_key
-)
-llm2 = ChatNVIDIA(
-    model="qwen/qwen3.5-122b-a10b", 
-    api_key=nvidia_key
-)
+# Configure LLM using multi-provider router
+# The router tries 30+ models across 5 providers (Groq, Gemini, Mistral, NVIDIA, OpenRouter)
+# in priority order (strongest + fastest first) with automatic failover.
+import logging
+logging.basicConfig(level=logging.INFO)
+llm = RoutedChatModel(temperature=0.3, max_tokens=4096)
 
 # ==========================================
 # 1. TOOL DEFINITIONS (LangChain @tool)
@@ -109,25 +102,64 @@ os.makedirs(PLOT_OUTPUT_DIR, exist_ok=True)
 
 @tool
 def execute_plot_code(code: str) -> str:
-    """Executes Python plotting code locally to generate an interactive Plotly chart saved as an HTML file."""
-    print("\n[Tool: execute_plot_code] Running Plotly code locally...\n")
+    """Executes Python plotting code in a sandboxed environment to generate an interactive Plotly chart saved as an HTML file."""
+    print("\n[Tool: execute_plot_code] Running Plotly code (sandboxed)...\n")
     
     import io, sys, webbrowser
+    import builtins as _builtins_module
+    import plotly
+    import plotly.express as px
+    import plotly.graph_objects as go
     
     # Determine output path
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = os.path.abspath(os.path.join(PLOT_OUTPUT_DIR, f"plot_{timestamp}.html"))
     
-    # Inject the output path so the code can reference it
-    exec_globals = {"__OUTPUT_PATH__": output_path}
+    # ── Sandbox: restrict imports to safe data/plotting libraries only ──
+    ALLOWED_IMPORTS = frozenset({
+        "pandas", "plotly", "json", "datetime", "math", "re",
+        "collections", "itertools", "functools", "textwrap", "numpy",
+    })
+    
+    _real_import = _builtins_module.__import__
+    
+    def _safe_import(name, *args, **kwargs):
+        root_module = name.split(".")[0]
+        if root_module not in ALLOWED_IMPORTS:
+            raise ImportError(
+                f"Import of '{name}' is blocked in sandboxed execution. "
+                f"Allowed: {', '.join(sorted(ALLOWED_IMPORTS))}"
+            )
+        return _real_import(name, *args, **kwargs)
+    
+    # Build restricted builtins: copy all standard builtins, then:
+    #   - Replace __import__ with safe version (blocks os, subprocess, etc.)
+    #   - Remove exec/eval/compile (prevents code injection)
+    safe_builtins = dict(vars(_builtins_module))
+    safe_builtins["__import__"] = _safe_import
+    for blocked in ("exec", "eval", "compile"):
+        safe_builtins.pop(blocked, None)
+    
+    # Pre-inject safe libraries so the LLM code can use them directly
+    safe_globals = {
+        "__builtins__": safe_builtins,
+        "pd": pd,
+        "px": px,
+        "go": go,
+        "plotly": plotly,
+        "__OUTPUT_PATH__": output_path,
+    }
     
     # Capture stdout
     old_stdout = sys.stdout
     sys.stdout = captured = io.StringIO()
     
     try:
-        exec(code, exec_globals)
+        exec(code, safe_globals)
         console_output = captured.getvalue()
+    except ImportError as e:
+        sys.stdout = old_stdout
+        return f"BLOCKED: {str(e)}"
     except Exception as e:
         sys.stdout = old_stdout
         return f"ERROR executing plot code: {str(e)[:2000]}"
@@ -159,27 +191,46 @@ def execute_plot_code(code: str) -> str:
 
 @tool
 def search_cricinfo(query: str, search_type: str = "") -> str:
-    """Provides a Google search link to find ESPNcricinfo profiles or matches.
+    """Searches ESPNcricinfo for IPL player profiles, stats, and match info.
     Args:
-        query: The search string (e.g. 'Virat Kohli').
+        query: The search string (e.g. 'Virat Kohli IPL stats').
         search_type: 'player', 'match', or general.
     """
     try:
-        # Append 'cricinfo' to ensure we get cricinfo results
-        search_term = f"{query.strip()} cricinfo"
-        encoded_query = urllib.parse.quote_plus(search_term)
-        url = f"https://www.google.com/search?q={encoded_query}"
+        search_query = f"{query.strip()} site:espncricinfo.com"
+        results = list(DDGS().text(search_query, max_results=3))
         
-        if search_type == "player":
-            return f"Found the Google search link for the player's Cricinfo profile: {url}"
-        return f"Found the Google search link for this query: {url}"
+        if not results:
+            # Fallback: broader search with cricinfo keyword
+            results = list(DDGS().text(f"{query.strip()} cricinfo IPL", max_results=3))
+        
+        if not results:
+            return f"No ESPNcricinfo results found for: {query}"
+        
+        formatted = []
+        for r in results:
+            formatted.append(f"**{r['title']}**\n{r['body']}\nLink: {r['href']}")
+        return "\n\n".join(formatted)
     except Exception as e:
-        return f"Search Error: {str(e)}"
+        # Fallback: return a search link
+        encoded_query = urllib.parse.quote_plus(f"{query.strip()} cricinfo")
+        return f"Search failed ({e}). Try this link: https://www.google.com/search?q={encoded_query}"
 
 @tool
 def web_search(query: str) -> str:
-    """Searches the internet for general cricket trivia, rules, or news."""
-    return f"Search results for: {query}"
+    """Searches the internet for general cricket trivia, rules, records, or news."""
+    try:
+        results = list(DDGS().text(f"{query.strip()} cricket IPL", max_results=5))
+        
+        if not results:
+            return f"No search results found for: {query}"
+        
+        formatted = []
+        for r in results:
+            formatted.append(f"**{r['title']}**\n{r['body']}\nSource: {r['href']}")
+        return "\n\n---\n\n".join(formatted)
+    except Exception as e:
+        return f"Web search failed: {str(e)}"
 
 @tool
 def resolve_player_name(player_name: str) -> str:
@@ -250,7 +301,9 @@ CRITICAL RULES AND CONSTRAINTS:
 8. TEAM FILTERING: When asked for a specific team's stats (e.g. "most runs for Mumbai Indians"), ensure you filter by `batting_team = 'Mumbai Indians'` in the scorecard, rather than just pulling all batters from matches where the team played.
 9. IMPORTANT NIM LIMITATION: You MUST ONLY output ONE tool call at a time. Do NOT attempt to call 'get_schema_info' and 'execute_bq_query' simultaneously in a single response. Wait for the result of the first tool before calling the next.
 10. Use the 'execute_bq_query' tool to run your SQL. Provide a concise text summary of the results. DO NOT output markdown tables of the raw data in your final answer; the raw CSV data will be rendered automatically by the UI.
-11. NEVER generate plotting code (matplotlib, plotly, etc). Your job is ONLY to query data and present results as text/tables. Plotting is handled by a separate agent."""
+11. NEVER generate plotting code (matplotlib, plotly, etc). Your job is ONLY to query data and present results as text/tables. Plotting is handled by a separate agent.
+12. SEASON FORMATS: Some seasons are stored with split years in the database. 2008 is '2007/08', 2010 is '2009/10', and 2020 is '2020/21'. If querying for these years, you MUST use the exact string (e.g., `season = '2020/21'`) or use a `LIKE` clause (e.g., `season LIKE '%2020%'`).
+13. WICKET COUNTING: For bowling stats (Purple Cap, most wickets, best bowler, etc.), ALWAYS use the `bowling_scorecard` table (SUM the `wickets` column), NOT the `wickets` table. The `wickets` table logs ALL dismissal events including run outs, retired hurt, retired out, and obstructing the field — these are NOT bowler wickets and will inflate counts. The `bowling_scorecard.wickets` column contains only the bowler's actual wickets per innings."""
 )
 
 plot_agent = create_react_agent(
@@ -268,7 +321,7 @@ CRITICAL RULES:
 )
 
 trivia_agent = create_react_agent(
-    llm2,
+    llm,
     tools=[search_cricinfo, web_search],
     prompt="""You are the master IPL AI Assistant for web and trivia searches.
 If asked about a specific player or match outside the database, use 'search_cricinfo'.
@@ -482,7 +535,8 @@ def run_agent(user_input: str, history: list) -> dict:
             "plot_path": final_state.get("plot_path", ""),
             "messages_update": final_state["messages"][-1] if final_state.get("messages") else None,
             "sql_queries": final_state.get("sql_queries", []),
-            "plot_code": final_state.get("plot_code", "")
+            "plot_code": final_state.get("plot_code", ""),
+            "csv_path": final_state.get("query_data", "")
         }
     except Exception as e:
         return {
@@ -490,7 +544,8 @@ def run_agent(user_input: str, history: list) -> dict:
             "plot_path": "",
             "messages_update": None,
             "sql_queries": [],
-            "plot_code": ""
+            "plot_code": "",
+            "csv_path": ""
         }
 
 # ==========================================

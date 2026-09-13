@@ -4,13 +4,13 @@
 ![Python](https://img.shields.io/badge/Python-3.10+-blue)
 ![LangGraph](https://img.shields.io/badge/LangGraph-Agentic_AI-orange)
 ![BigQuery](https://img.shields.io/badge/Google_Cloud-BigQuery-4285F4)
-![NVIDIA NIM](https://img.shields.io/badge/NVIDIA-NIM_API-76B900)
+![Multi-LLM](https://img.shields.io/badge/LLM-Multi--Provider_Router-9cf)
 
 ---
 
 ## Overview
 
-**Stumped AI** is a multi-agent, LangGraph-powered conversational assistant that answers complex questions about the Indian Premier League (IPL). Rather than relying on hallucinated LLM knowledge, the system operates on a **Tool-Augmented Generation** architecture — it writes and executes real SQL against a Google Cloud BigQuery warehouse, generates interactive Plotly visualizations from the actual query results, and falls back to web search for trivia that lives outside the database.
+**Stumped AI** is a multi-agent, LangGraph-powered conversational assistant that answers complex questions about the Indian Premier League (IPL). Rather than relying on hallucinated LLM knowledge, the system operates on a **Tool-Augmented Generation** architecture — it writes and executes real SQL against a Google Cloud BigQuery warehouse, generates interactive Plotly visualizations from the actual query results, and falls back to live web search (DuckDuckGo) for trivia that lives outside the database.
 
 ### Why This Exists
 
@@ -21,6 +21,7 @@ Traditional chatbots either hallucinate statistics or require rigid, pre-built d
 ## Table of Contents
 
 - [Architecture Overview](#architecture-overview)
+- [Multi-Provider LLM Router](#multi-provider-llm-router)
 - [Agent Deep Dive](#agent-deep-dive)
   - [Router (Intent Classification)](#1-router-intent-classification)
   - [Data Agent (BigQuery SQL Expert)](#2-data-agent-bigquery-sql-expert)
@@ -33,7 +34,7 @@ Traditional chatbots either hallucinate statistics or require rigid, pre-built d
 - [Tech Stack](#tech-stack)
 - [Project Structure](#project-structure)
 - [Setup & Installation](#setup--installation)
-- [Deployment (Render)](#deployment-render)
+- [Deployment](#deployment)
 
 ---
 
@@ -61,13 +62,55 @@ Traditional chatbots either hallucinate statistics or require rigid, pre-built d
                            │
               ┌────────────┼────────────┐
               ▼            ▼            ▼
-        ┌──────────┐ ┌──────────┐ ┌──────────┐
-        │ BigQuery │ │  Plotly   │ │  Google  │
-        │  (GCP)   │ │ (Local)  │ │  Search  │
-        └──────────┘ └──────────┘ └──────────┘
+        ┌──────────┐ ┌──────────┐ ┌────────────┐
+        │ BigQuery │ │  Plotly   │ │ DuckDuckGo │
+        │  (GCP)   │ │(Sandboxed)│ │ Web Search │
+        └──────────┘ └──────────┘ └────────────┘
 ```
 
 The system is composed of **three specialised sub-agents** orchestrated by a **deterministic LangGraph state machine**. Each agent is a ReAct loop (Reason → Act → Observe) built with `create_react_agent`, constrained to its own tool subset.
+
+---
+
+## Multi-Provider LLM Router
+
+Instead of relying on a single LLM provider, Stumped AI uses a custom **Multi-Provider Router** (`RoutedChatModel`) that wraps 5 providers and 33 models behind a unified LangChain-compatible `BaseChatModel` interface.
+
+```
+                    ┌─────────────────┐
+                    │  RoutedChatModel │
+                    │  (LangChain)     │
+                    └────────┬────────┘
+                             │
+            ┌────────────────┼────────────────┐
+            ▼                ▼                ▼
+   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+   │  Groq (Fast) │  │ Gemini (Free)│  │ Mistral      │  ...
+   │  3 keys      │  │  3 keys      │  │  3 keys      │
+   └──────────────┘  └──────────────┘  └──────────────┘
+```
+
+### Key Features
+
+| Feature | Description |
+|---------|-------------|
+| **5 Providers** | Groq, Google Gemini, Mistral, NVIDIA NIM, OpenRouter |
+| **33-Model Chain** | Models sorted by priority score (Reasoning × Speed). Strongest & fastest tried first. |
+| **Auto-Failover** | If a model rate-limits or errors, the router instantly tries the next model/provider. |
+| **Round-Robin Keys** | Multiple API keys per provider are rotated to distribute rate limits. |
+| **Cooldown Tracking** | Rate-limited or errored models are temporarily suspended with configurable cooldown periods. |
+| **LangChain Bridge** | `RoutedChatModel` extends `BaseChatModel` — fully compatible with `create_react_agent` and tool calling. |
+
+### Architecture
+
+```
+ipl_agent/llm/
+├── config.py              # Router settings (timeouts, cooldowns, defaults)
+├── providers.py           # Provider endpoints + key reading from .env
+├── models.py              # 33-model registry with priority scores
+├── router.py              # Async failover engine (rate-limit aware)
+└── langchain_wrapper.py   # RoutedChatModel — LangChain BaseChatModel bridge
+```
 
 ---
 
@@ -111,7 +154,6 @@ User Message
 ### 2. Data Agent (BigQuery SQL Expert)
 
 **File**: `ipl_agent/agent.py` — `data_agent` (ReAct agent)  
-**LLM**: `google/diffusiongemma-26b-a4b-it` via NVIDIA NIM  
 **Tools**: `get_schema_info`, `execute_bq_query`, `resolve_player_name`
 
 The Data Agent is the core analytical engine. It receives a natural language question and autonomously:
@@ -148,24 +190,25 @@ User: "Top 5 run scorers in IPL 2024"
 
 #### Critical Rules Enforced via System Prompt
 
-| Rule | Purpose |
-|------|---------|
-| Always call `get_schema_info` first | Prevents hallucinated column names |
-| Call `resolve_player_name` for player queries | Handles abbreviated name format in DB |
-| JOIN with `matches` for temporal queries | Scorecard tables lack a `season` column |
-| Use `(SUM(runs)/SUM(balls))*100` for strike rate | Prevents incorrect `AVG(strike_rate)` |
-| Filter by `batting_team` for team stats | Prevents pulling opponent batters |
-| One tool call per LLM turn | NVIDIA NIM limitation workaround |
-| Never generate plot code | Separation of concerns — plotting is the Plot Agent's job |
-| Auto-append `LIMIT 1000` | Safety guardrail for runaway queries |
+| # | Rule | Purpose |
+|---|------|---------|
+| 1 | Always call `get_schema_info` first | Prevents hallucinated column names |
+| 2 | Call `resolve_player_name` for player queries | Handles abbreviated name format in DB |
+| 3 | JOIN with `matches` for temporal queries | Scorecard tables lack a `season` column |
+| 4 | Use `(SUM(runs)/SUM(balls))*100` for strike rate | Prevents incorrect `AVG(strike_rate)` |
+| 5 | Filter by `batting_team` for team stats | Prevents pulling opponent batters |
+| 6 | One tool call per LLM turn | Prevents parallel tool-call errors |
+| 7 | Never generate plot code | Separation of concerns — Plot Agent's job |
+| 8 | Auto-append `LIMIT 1000` | Safety guardrail for runaway queries |
+| 9 | Season format awareness | Handles split-year seasons like `'2020/21'` |
+| 10 | Use `bowling_scorecard` for wickets | `wickets` table includes run-outs, inflating counts |
 
 ---
 
 ### 3. Plot Agent (Visualization Scientist)
 
 **File**: `ipl_agent/agent.py` — `plot_agent` (ReAct agent)  
-**LLM**: `google/diffusiongemma-26b-a4b-it` via NVIDIA NIM  
-**Tools**: `execute_plot_code`
+**Tools**: `execute_plot_code` (Sandboxed)
 
 The Plot Agent is invoked **after** the Data Agent whenever a CSV file was generated. It receives:
 - The **CSV file path** from the Data Agent's query results
@@ -193,27 +236,29 @@ Data Agent Output (CSV + SQL + Answer)
 └──────────────┬───────────────────┘
                ▼
 ┌──────────────────────────────────┐
-│  execute_plot_code tool          │  ← exec() in sandboxed globals
-│  - Captures stdout               │
-│  - Saves HTML to plots/ dir      │
-│  - Returns SUCCESS + file path   │
+│  execute_plot_code tool          │  ← Sandboxed exec() with import whitelist
+│  - Only pandas/plotly/numpy/math │
+│  - os/subprocess/sys BLOCKED     │
+│  - exec/eval/compile REMOVED     │
 └──────────────────────────────────┘
 ```
+
+#### Sandboxed Execution
+
+The `execute_plot_code` tool runs LLM-generated Python in a restricted environment:
+- **Import whitelist**: Only `pandas`, `plotly`, `numpy`, `json`, `datetime`, `math`, `re`, `collections`, `itertools`, `functools`, `textwrap` are allowed.
+- **Blocked imports**: `os`, `sys`, `subprocess`, `socket`, `shutil`, `http`, `ctypes`, and all others are rejected with an `ImportError`.
+- **Removed builtins**: `exec()`, `eval()`, and `compile()` are stripped from the sandbox's builtins dict.
 
 #### Anti-Hallucination Design
 
 The Plot Agent **never hardcodes data values**. It is instructed to always load from the CSV file generated by the Data Agent. This ensures the visualized data is identical to the queried data — no LLM fabrication of numbers.
-
-#### Why Context Trimming?
-
-The full LangGraph message history contains tool calls, schema dumps, and SQL results from the Data Agent. Passing all of this to the Plot Agent would confuse it and waste context window. Instead, only a surgically crafted prompt with the CSV path, SQL context, and user question is forwarded.
 
 ---
 
 ### 4. Trivia Agent (Web Search)
 
 **File**: `ipl_agent/agent.py` — `trivia_agent` (ReAct agent)  
-**LLM**: `qwen/qwen3.5-122b-a10b` via NVIDIA NIM  
 **Tools**: `search_cricinfo`, `web_search`
 
 The Trivia Agent handles questions that **don't require database queries** — player profiles, cricket rules, news, general knowledge, or ESPNcricinfo lookups.
@@ -225,18 +270,23 @@ User: "Tell me about Virat Kohli's career"
      │
      ▼
 ┌─────────────────────────────┐
-│  search_cricinfo             │  ← Generates Google search URL:
-│  query="Virat Kohli"         │     google.com/search?q=Virat+Kohli+cricinfo
+│  search_cricinfo             │  ← DuckDuckGo search: site:espncricinfo.com
+│  query="Virat Kohli IPL"     │     Returns actual result snippets + URLs
 │  search_type="player"        │
 └──────────────┬──────────────┘
                ▼
 ┌─────────────────────────────┐
-│  Friendly response with     │  ← "Here's the Cricinfo profile link for
-│  search link included       │     Virat Kohli: [link]"
+│  web_search                  │  ← Broader DuckDuckGo search for cricket trivia
+│  query="Virat Kohli career"  │     Returns top 5 results with sources
+└──────────────┬──────────────┘
+               ▼
+┌─────────────────────────────┐
+│  LLM synthesizes a response │  ← Combines real search data into a friendly answer
+│  with source links           │
 └─────────────────────────────┘
 ```
 
-**Why a separate LLM?** The Trivia Agent uses `qwen/qwen3.5-122b-a10b` instead of the Gemma model used by the other agents. This is because the trivia tasks benefit from a model with broader general knowledge and conversational ability, while the data/plot agents need a model that excels at structured output (SQL, Python).
+**Real Search**: Both tools use [DuckDuckGo](https://duckduckgo.com/) via the `ddgs` library — **no API key required**. `search_cricinfo` targets `site:espncricinfo.com` specifically, while `web_search` performs broader queries.
 
 ---
 
@@ -247,11 +297,11 @@ Each tool is a `@tool`-decorated LangChain function with a Pydantic schema for a
 | Tool | Agent | Description |
 |------|-------|-------------|
 | `get_schema_info` | Data | Fetches BigQuery table schemas (columns, types, descriptions). Results are cached in `_SCHEMA_CACHE` to avoid repeat API calls. |
-| `execute_bq_query` | Data | Runs a SQL query on BigQuery, saves results as a CSV to `query_results/`, and returns a data preview (first 50 rows as JSON). |
+| `execute_bq_query` | Data | Runs a SQL query on BigQuery, saves results as a CSV to `query_results/`, and returns a data preview (first 50 rows as JSON). Auto-appends `LIMIT 1000` if missing. |
 | `resolve_player_name` | Data | Converts full player names to the abbreviated format used in the database. Uses exact match → surname match → initial narrowing → fuzzy substring fallback. Player names are cached in `_PLAYER_NAME_CACHE`. |
-| `execute_plot_code` | Plot | Executes arbitrary Python code via `exec()` in an isolated namespace. Injects `__OUTPUT_PATH__` for the chart output location. Captures stdout as a fallback if no file is written. |
-| `search_cricinfo` | Trivia | Constructs a Google search URL targeting ESPNcricinfo results. |
-| `web_search` | Trivia | Placeholder for general web search queries. |
+| `execute_plot_code` | Plot | Executes LLM-generated Python code in a sandboxed namespace. Only data/plotting imports are whitelisted. Injects `__OUTPUT_PATH__` for chart location. |
+| `search_cricinfo` | Trivia | Performs a DuckDuckGo search targeting `site:espncricinfo.com`. Returns real result snippets with titles, summaries, and URLs. |
+| `web_search` | Trivia | Performs a broader DuckDuckGo search for general cricket/IPL trivia. Returns top 5 results with source links. |
 
 ---
 
@@ -417,18 +467,19 @@ Returns: { answer, plot_path, sql_queries, plot_code, csv_path }
 | **Frontend** | Streamlit |
 | **Orchestration** | LangGraph (StateGraph with deterministic routing) |
 | **Agent Framework** | LangChain (`create_react_agent`, `@tool`) |
-| **LLMs** | NVIDIA NIM — `google/diffusiongemma-26b-a4b-it` (Data/Plot), `qwen/qwen3.5-122b-a10b` (Trivia) |
+| **LLM Providers** | Groq, Google Gemini, Mistral, NVIDIA NIM, OpenRouter — via multi-provider router |
 | **Database** | Google Cloud BigQuery |
-| **Visualization** | Plotly (interactive HTML charts) |
+| **Visualization** | Plotly (interactive HTML charts, sandboxed execution) |
+| **Web Search** | DuckDuckGo (`ddgs`) — no API key required |
 | **Data Source** | [Cricsheet.org](https://cricsheet.org/) (ball-by-ball JSON) |
-| **Deployment** | Render (Web Service) |
+| **Deployment** | Streamlit Community Cloud / Render |
 
 ---
 
 ## Project Structure
 
 ```
-ipl_stat_genai/
+stumped-ai/
 ├── app.py                          # Streamlit frontend (chat UI)
 ├── requirements.txt                # Python dependencies
 ├── .env                            # Environment variables (gitignored)
@@ -436,7 +487,14 @@ ipl_stat_genai/
 │
 ├── ipl_agent/
 │   ├── __init__.py
-│   └── agent.py                    # LangGraph workflow + 3 sub-agents + 6 tools
+│   ├── agent.py                    # LangGraph workflow + 3 sub-agents + 6 tools
+│   └── llm/                        # Multi-provider LLM router module
+│       ├── __init__.py
+│       ├── config.py               # Router settings (timeouts, cooldowns)
+│       ├── providers.py            # 5 provider endpoints + key reading
+│       ├── models.py               # 33-model registry with priority scores
+│       ├── router.py               # Async failover engine
+│       └── langchain_wrapper.py    # LangChain BaseChatModel bridge
 │
 ├── data_pipeline/
 │   └── parse_ipl.py                # ETL: Cricsheet JSON → BigQuery tables
@@ -459,7 +517,7 @@ ipl_stat_genai/
 
 - Python 3.10+
 - Google Cloud Service Account with **BigQuery Data Viewer** and **BigQuery Job User** roles
-- [NVIDIA NIM API Key](https://build.nvidia.com/)
+- At least one LLM provider API key (see below)
 
 ### 1. Clone & Install
 
@@ -471,13 +529,33 @@ pip install -r requirements.txt
 
 ### 2. Environment Variables
 
-Create a `.env` file in the project root:
+Create a `.env` file in the project root. The LLM router accepts **comma-separated** lists of API keys for each provider. You don't need all providers — **just one valid key for one provider is enough** to run the app.
 
 ```env
-NVIDIA_NIM_API_KEY=your_nvidia_key_here
+# GCP Config
 GCP_PROJECT_ID=your_gcp_project_id
 GCP_DATASET_ID=ipl_stats
+
+# LLM Provider Keys (comma-separated for load balancing)
+# Provide at least ONE of the following:
+GROQ_API_KEYS=gsk_...
+GEMINI_API_KEYS=AIza...
+MISTRAL_API_KEYS=...
+NVIDIA_API_KEYS=nvapi-...
+OPENROUTER_API_KEYS=sk-or-v1-...
 ```
+
+#### Where to Get API Keys
+
+| Provider | Free Tier | Link |
+|----------|-----------|------|
+| **Groq** | ~14,400 req/day | [console.groq.com/keys](https://console.groq.com/keys) |
+| **Google Gemini** | 1M context, generous free tier | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
+| **Mistral** | ~1B tokens/month "Experiment" plan | [console.mistral.ai/api-keys](https://console.mistral.ai/api-keys) |
+| **NVIDIA NIM** | Credit-based free tier | [build.nvidia.com](https://build.nvidia.com/) |
+| **OpenRouter** | ~20 RPM free (many free models) | [openrouter.ai/keys](https://openrouter.ai/keys) |
+
+> **Note**: DuckDuckGo search (used by the Trivia Agent) is completely free and requires no API key.
 
 ### 3. GCP Credentials
 
@@ -505,16 +583,56 @@ streamlit run app.py
 
 ---
 
-## Deployment (Render)
+## Deployment
 
-This application is fully configured for deployment on [Render](https://render.com/).
+### Streamlit Community Cloud
+
+1. Push your code to GitHub.
+2. Go to [share.streamlit.io](https://share.streamlit.io/) and connect your repo.
+3. Set the **Main file path** to `app.py`.
+4. Under **Advanced Settings > Secrets**, add your environment variables in TOML format:
+
+```toml
+GCP_PROJECT_ID = "your_project_id"
+GCP_DATASET_ID = "ipl_stats"
+GROQ_API_KEYS = "gsk_key1,gsk_key2"
+GEMINI_API_KEYS = "AIza_key1,AIza_key2"
+MISTRAL_API_KEYS = "key1,key2"
+NVIDIA_API_KEYS = "nvapi-key1,nvapi-key2"
+OPENROUTER_API_KEYS = "sk-or-v1-key1,sk-or-v1-key2"
+```
+
+5. For GCP credentials, add a `[gcp_service_account]` section in secrets with the contents of your `service-account.json`:
+
+```toml
+[gcp_service_account]
+type = "service_account"
+project_id = "your-project-id"
+private_key_id = "..."
+private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+client_email = "..."
+client_id = "..."
+auth_uri = "https://accounts.google.com/o/oauth2/auth"
+token_uri = "https://oauth2.googleapis.com/token"
+```
+
+Then in your app, load it with:
+```python
+import json, streamlit as st
+from google.oauth2 import service_account
+credentials = service_account.Credentials.from_service_account_info(
+    st.secrets["gcp_service_account"]
+)
+```
+
+### Render
 
 | Setting | Value |
 |---------|-------|
 | **Build Command** | `pip install -r requirements.txt` |
 | **Start Command** | `streamlit run app.py --server.port $PORT --server.address 0.0.0.0` |
-| **Environment Variables** | `NVIDIA_NIM_API_KEY`, `GCP_PROJECT_ID`, `GCP_DATASET_ID` |
-| **Secret Files** | Upload `service-account.json` via Render's Secret Files feature. Set `GOOGLE_APPLICATION_CREDENTIALS` to point to its path. |
+| **Environment Variables** | `GCP_PROJECT_ID`, `GCP_DATASET_ID`, all `*_API_KEYS` vars |
+| **Secret Files** | Upload `service-account.json` via Render's Secret Files. Set `GOOGLE_APPLICATION_CREDENTIALS` to its path. |
 
 ---
 

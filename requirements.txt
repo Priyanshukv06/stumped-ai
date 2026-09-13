@@ -1,7 +1,10 @@
 # Core LangChain & Agents
 langchain-core
-langchain-nvidia-ai-endpoints
 langgraph
+
+# Multi-provider LLM Router (OpenAI-compatible client)
+openai
+nest_asyncio
 
 # Data & Environment
 pandas
@@ -15,9 +18,10 @@ pandas-gbq
 # Visualization
 plotly
 
-# Web Scraping (Trivia Agent)
+# Web Scraping & Search (Trivia Agent)
 requests
 beautifulsoup4
+ddgs
 
 # Frontend
 streamlit
