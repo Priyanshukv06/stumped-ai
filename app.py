@@ -12,7 +12,7 @@ from ipl_agent.agent import run_agent
 # ==========================================
 # 1. CLEANUP OLD FILES
 # ==========================================
-def cleanup_old_files(days=2):
+def cleanup_old_files(days=2, max_files=200):
     import glob
     now = time.time()
     cutoff = now - (days * 86400)
@@ -27,6 +27,13 @@ def cleanup_old_files(days=2):
                         os.remove(file_path)
                     except Exception:
                         pass
+            # Enforce max file count to prevent disk exhaustion
+            remaining = sorted(glob.glob(os.path.join(dir_path, '*')), key=os.path.getmtime)
+            while len(remaining) > max_files:
+                try:
+                    os.remove(remaining.pop(0))
+                except Exception:
+                    break
 
 # Run cleanup on app startup
 cleanup_old_files(2)
@@ -47,6 +54,14 @@ if "messages" not in st.session_state:
 # Agent History (what is passed to LangGraph for memory)
 if "agent_history" not in st.session_state:
     st.session_state.agent_history = []
+# Rate Limiting
+if "query_count" not in st.session_state:
+    st.session_state.query_count = 0
+if "last_query_time" not in st.session_state:
+    st.session_state.last_query_time = 0.0
+
+MAX_QUERIES_PER_SESSION = 15
+MIN_QUERY_INTERVAL_SECONDS = 5
 
 # ==========================================
 # 3. RENDER CHAT HISTORY
@@ -92,11 +107,31 @@ if prompt := st.chat_input("E.g., Which 5 teams hit the most sixes in 2024? Plot
     # Process Assistant Response
     with st.chat_message("assistant"):
         
+        # ── Guardrail: Rate Limiting ──
+        _now = time.time()
+        if st.session_state.query_count >= MAX_QUERIES_PER_SESSION:
+            _msg = f"\U0001f6ab You've reached the limit of {MAX_QUERIES_PER_SESSION} queries for this session. Please refresh the page to start a new session."
+            st.warning(_msg)
+            st.session_state.messages.append({"role": "assistant", "content": _msg, "plot_path": None, "sql_queries": [], "plot_code": "", "csv_path": None})
+            st.stop()
+        
+        _elapsed = _now - st.session_state.last_query_time
+        if _elapsed < MIN_QUERY_INTERVAL_SECONDS:
+            _wait = int(MIN_QUERY_INTERVAL_SECONDS - _elapsed) + 1
+            _msg = f"\u23f3 Please wait {_wait} seconds between queries."
+            st.warning(_msg)
+            st.session_state.messages.append({"role": "assistant", "content": _msg, "plot_path": None, "sql_queries": [], "plot_code": "", "csv_path": None})
+            st.stop()
+        
         with st.status("Agent Workflow Initiated...", expanded=True) as status:
-            st.write("🧠 Analyzing intent and executing tools...")
+            st.write("\U0001f9e0 Analyzing intent and executing tools...")
             
             # Execute the LangGraph Agent
             result = run_agent(prompt, st.session_state.agent_history)
+            
+            # Update rate limit counters
+            st.session_state.query_count += 1
+            st.session_state.last_query_time = time.time()
             
             # Update internal agent history for multi-turn context
             st.session_state.agent_history.append(HumanMessage(content=prompt))
